@@ -8,6 +8,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
 
 /**
  * A* over cubes of the chunk octrees, as the native PathFinder.cpp had it. A node is a cube of 2
@@ -271,11 +273,15 @@ final class PathFinder {
                 return bestPathSoFar(s.bestSoFar, startCenter, goalCenter);
             }
             if (!airIfFake && doneFull.add(NetherPathfinder.key(cx, cz))) {
-                // the native library generated these four on its worker threads
-                ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx, cz - 1, fakeChunkMode);
-                ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx, cz + 1, fakeChunkMode);
-                ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx + 1, cz, fakeChunkMode);
+                // the four neighbouring chunks at once, three on the common pool and one here, as
+                // the native library did on its worker threads
+                final ForkJoinTask<?> north = ForkJoinPool.commonPool().submit((Runnable) () -> ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx, cz - 1, fakeChunkMode));
+                final ForkJoinTask<?> south = ForkJoinPool.commonPool().submit((Runnable) () -> ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx, cz + 1, fakeChunkMode));
+                final ForkJoinTask<?> east = ForkJoinPool.commonPool().submit((Runnable) () -> ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx + 1, cz, fakeChunkMode));
                 ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx - 1, cz, fakeChunkMode);
+                north.join();
+                south.join();
+                east.join();
             }
 
             for (Face face : ALL_FACES) {

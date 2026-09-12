@@ -1,6 +1,9 @@
 package dev.babbaj.pathfinder;
 
 import java.util.Random;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
 
 /** The nether's terrain shape for a seed, as Minecraft generated it and the native library ported it. */
 final class ChunkGeneratorHell {
@@ -41,9 +44,17 @@ final class ChunkGeneratorHell {
 
     private double[] getHeights(int xOffset, int yOffset, int zOffset) {
         final double[] buffer = new double[X_SIZE * Y_SIZE * Z_SIZE];
+        // The three noise fields take most of a chunk's time and do not depend on each other, so
+        // two go to the common pool while this thread does the third, as the native library did
+        // with its own worker threads. A pool thread that is itself generating a chunk helps out
+        // while it waits, so nesting is fine.
+        final ForkJoinTask<double[]> arTask = ForkJoinPool.commonPool().submit((Callable<double[]>) () ->
+                this.lperlinNoise1.generateNoiseOctaves(xOffset, yOffset, zOffset, X_SIZE, Y_SIZE, Z_SIZE, 684.412, 2053.236, 684.412));
+        final ForkJoinTask<double[]> brTask = ForkJoinPool.commonPool().submit((Callable<double[]>) () ->
+                this.lperlinNoise2.generateNoiseOctaves(xOffset, yOffset, zOffset, X_SIZE, Y_SIZE, Z_SIZE, 684.412, 2053.236, 684.412));
         final double[] pnr = this.perlinNoise1.generateNoiseOctaves(xOffset, yOffset, zOffset, X_SIZE, Y_SIZE, Z_SIZE, 8.555150000000001, 34.2206, 8.555150000000001);
-        final double[] ar = this.lperlinNoise1.generateNoiseOctaves(xOffset, yOffset, zOffset, X_SIZE, Y_SIZE, Z_SIZE, 684.412, 2053.236, 684.412);
-        final double[] br = this.lperlinNoise2.generateNoiseOctaves(xOffset, yOffset, zOffset, X_SIZE, Y_SIZE, Z_SIZE, 684.412, 2053.236, 684.412);
+        final double[] ar = arTask.join();
+        final double[] br = brTask.join();
 
         int i = 0;
         final double[] adouble = new double[Y_SIZE];
