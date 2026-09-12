@@ -189,6 +189,11 @@ public final class NetherPathfinder implements AutoCloseable {
         return e != null && e.state == STATE_FROM_JAVA;
     }
 
+    /** Whether the table holds chunk (x, z), whichever way it got there. */
+    boolean hasChunk(int x, int z) {
+        return this.chunks.containsKey(key(x, z));
+    }
+
     /** Forgets every chunk more than maxDistanceBlocks (in whole chunks) from (chunkX, chunkZ). */
     public void cullFarChunks(int chunkX, int chunkZ, int maxDistanceBlocks) {
         final long distChunks = maxDistanceBlocks / 16;

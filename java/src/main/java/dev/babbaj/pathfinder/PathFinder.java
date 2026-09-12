@@ -8,7 +8,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
 
 /**
@@ -273,15 +272,7 @@ final class PathFinder {
                 return bestPathSoFar(s.bestSoFar, startCenter, goalCenter);
             }
             if (!airIfFake && doneFull.add(NetherPathfinder.key(cx, cz))) {
-                // the four neighbouring chunks at once, three on the common pool and one here, as
-                // the native library did on its worker threads
-                final ForkJoinTask<?> north = ForkJoinPool.commonPool().submit((Runnable) () -> ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx, cz - 1, fakeChunkMode));
-                final ForkJoinTask<?> south = ForkJoinPool.commonPool().submit((Runnable) () -> ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx, cz + 1, fakeChunkMode));
-                final ForkJoinTask<?> east = ForkJoinPool.commonPool().submit((Runnable) () -> ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx + 1, cz, fakeChunkMode));
-                ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(cx - 1, cz, fakeChunkMode);
-                north.join();
-                south.join();
-                east.join();
+                generateMissingNeighbours(ctx, cx, cz);
             }
 
             for (Face face : ALL_FACES) {
@@ -298,6 +289,34 @@ final class PathFinder {
             }
         }
         return bestPathSoFar(s.bestSoFar, startCenter, goalCenter);
+    }
+
+    private static final int[] NEIGHBOUR_OFFSETS = {0, -1, 0, 1, 1, 0, -1, 0}; // north, south, east, west
+
+    /**
+     * Generates those of the four chunks around (cx, cz) that the table does not have yet, all at
+     * once: the first on this thread and the others on the common pool, as the native library did
+     * on its worker threads. A chunk the table has costs one probe. The native library handed all
+     * four to its threads whether they existed or not, and its threads were idle workers of its own;
+     * a task on the common pool costs more than the probe, and a search over terrain that is all
+     * there, which is what a flight over loaded chunks runs, would pay it for every chunk it enters.
+     */
+    private static void generateMissingNeighbours(NetherPathfinder ctx, int cx, int cz) {
+        List<ForkJoinTask<?>> missing = null;
+        for (int i = 0; i < NEIGHBOUR_OFFSETS.length; i += 2) {
+            final int nx = cx + NEIGHBOUR_OFFSETS[i];
+            final int nz = cz + NEIGHBOUR_OFFSETS[i + 1];
+            if (ctx.hasChunk(nx, nz)) {
+                continue;
+            }
+            if (missing == null) {
+                missing = new ArrayList<>(4);
+            }
+            missing.add(ForkJoinTask.adapt((Runnable) () -> ctx.getOrGenChunk(nx, nz)));
+        }
+        if (missing != null) {
+            ForkJoinTask.invokeAll(missing); // runs the first here and forks the rest to the pool
+        }
     }
 
     /** Segment after segment until the goal, generating terrain. What the native main.cpp ran. */

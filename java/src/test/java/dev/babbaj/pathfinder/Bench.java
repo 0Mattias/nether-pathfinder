@@ -1,5 +1,7 @@
 package dev.babbaj.pathfinder;
 
+import java.util.Arrays;
+
 /**
  * The numbers the port is held to, over the same kind of input as the native benchmarks: rays
  * through real terrain, path searches over it, and the 100k-block generating search of main.cpp.
@@ -49,18 +51,33 @@ public final class Bench {
             System.out.printf("java: %d rays (30-150 blocks, air origins), SOLID mode: %.0f ms, %.3f us/ray, %.2f%% hit%n", rays, ms, ms * 1000 / rays, 100.0 * hit / rays);
         }
 
-        for (int dist : new int[]{300, 800}) {
-            long total = 0, blocks = 0;
-            int finished = 0;
-            final int runs = 20;
-            for (int r = 0; r < runs; r++) {
-                final int sx = (int) between(rng, 16.0, lim - 16.0 - dist), sz = (int) between(rng, 16.0, lim - 16.0);
-                t0 = System.nanoTime();
-                final PathSegment p = ctx.pathFind(sx, 60, sz, sx + dist, 60, sz, true, false, 10000, true, 8.0);
-                total += (System.nanoTime() - t0) / 1000;
-                if (p != null) { blocks += p.packed.length; if (p.finished) finished++; }
+        // The same searches twice: treating a chunk the table lacks as air, and generating it. Every
+        // chunk is in the table by the timed pass, so the second never generates and must cost no
+        // more than the first; it is the search a flight that predicts terrain runs over the chunks
+        // it has loaded. The untimed pass generates what the searches reach past the world's edge.
+        final long searchSeed = rng[0];
+        for (int pass = 0; pass < 2; pass++) {
+            for (boolean airIfFake : new boolean[]{true, false}) {
+                rng[0] = searchSeed;
+                for (int dist : new int[]{300, 800}) {
+                    long total = 0, blocks = 0;
+                    int finished = 0;
+                    final int runs = 20;
+                    final long[] us = new long[runs]; // one search that runs into the 500 ms timeout dominates the average
+                    for (int r = 0; r < runs; r++) {
+                        final int sx = (int) between(rng, 16.0, lim - 16.0 - dist), sz = (int) between(rng, 16.0, lim - 16.0);
+                        t0 = System.nanoTime();
+                        final PathSegment p = ctx.pathFind(sx, 60, sz, sx + dist, 60, sz, true, false, 10000, airIfFake, 8.0);
+                        us[r] = (System.nanoTime() - t0) / 1000;
+                        total += us[r];
+                        if (p != null) { blocks += p.packed.length; if (p.finished) finished++; }
+                    }
+                    if (pass == 0) continue;
+                    Arrays.sort(us);
+                    System.out.printf("java pathFind %s over %d blocks: avg %d us, median %d us, avg %d path nodes, %d/%d reached the goal%n",
+                            airIfFake ? "airIfFake" : "generating, every chunk present,", dist, total / runs, us[runs / 2], blocks / runs, finished, runs);
+                }
             }
-            System.out.printf("java pathFind airIfFake over %d blocks: avg %d us, avg %d path nodes, %d/%d reached the goal%n", dist, total / runs, blocks / runs, finished, runs);
         }
 
         final NetherPathfinder fresh = new NetherPathfinder(Oracle.SEED, null, NetherPathfinder.DIMENSION_NETHER, 128);
