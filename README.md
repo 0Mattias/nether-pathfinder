@@ -4,9 +4,9 @@ High performance pathfinder for Minecraft's nether dimension, useful for travell
 This repo is the core library for pathfinding thus is not useful on its own. See [Baritone's elytra branch](https://github.com/cabaletta/baritone/tree/elytra) or [nether-pathfinder-mod](https://github.com/babbaj/nether-pathfinder-mod) for integration inside of a forge mod.
 
 # Building
-The native shared library can be built like a typical cmake project but requires clang 13 (gcc currently outputs broken code).
+The library is plain Java: `cd java && ./gradlew build` produces the jar and runs the tests. It needs no native code and runs wherever Java 8 or later does.
 
-The full java library with native code can be built by the gradle project in the `java` subdirectory and uses `zig cc` to build the native code (zig 0.9.1 is known to work).
+The C++ sources in `src` are the original native implementation, kept while the port settles. The tests under `java` check the port against what the native code answers (`java/oracle/oracle.cpp` regenerates those answers), and the native library still builds like a typical cmake project with clang 13 or later.
 
 # Performance
 On my Ryzen 5900x in Linux it pathfinds around 25,000 blocks/second.

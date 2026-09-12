@@ -1,182 +1,353 @@
 package dev.babbaj.pathfinder;
 
-import org.tukaani.xz.XZInputStream;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.UncheckedIOException;
-import java.nio.file.*;
-import java.util.Objects;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
-
-public class NetherPathfinder {
+/**
+ * A pathfinder and raytracer over a cache of one-bit-per-block chunks, for flying the nether by
+ * elytra. One instance is what the native library called a context: a world's seed and dimension,
+ * the chunks it has been given or has generated, and a search that can be cancelled.
+ * <p>
+ * The method names are the ones the native API had, with objects where it had pointers: a chunk
+ * is a {@link Chunk} that stays valid for as long as it is referenced, and there is nothing to free.
+ * Lookups, inserts, the search and rays may all run at the same time from different threads.
+ */
+public final class NetherPathfinder implements AutoCloseable {
 
     // How the raytracer will treat chunks that aren't actually observed.
-    // When chunk generation is used the caller must synchronize calls that read from the cache with calls that may mutate the cache.
-    // No synchronization is done within the jni code
-    public static int CACHE_MISS_GENERATE = 0;
-    public static int CACHE_MISS_AIR = 1;
-    public static int CACHE_MISS_SOLID = 2;
+    public static final int CACHE_MISS_GENERATE = 0;
+    public static final int CACHE_MISS_AIR = 1;
+    public static final int CACHE_MISS_SOLID = 2;
 
-    public static int DIMENSION_OVERWORLD = 0;
-    public static int DIMENSION_NETHER = 1;
-    public static int DIMENSION_END = 2;
+    public static final int DIMENSION_OVERWORLD = 0;
+    public static final int DIMENSION_NETHER = 1;
+    public static final int DIMENSION_END = 2;
 
-    // pass true to use the custom chunk allocator that will reduce memory usage and maybe be faster. false to just use new/delete
-    // this is only supported on systems with 4k pages
-    public static native long newContext(long seed, String baritoneCacheDirCanBeNull, int dimension, int maxHeight, boolean allocator);
-    public static native void freeContext(long pointer);
+    static final int STATE_FROM_JAVA = 0;
+    static final int STATE_FAKE = 1; // could be generated or just air
 
-    /*
-    from BlockStateContainer
-    private static int getIndex(int x, int y, int z)
-    {
-        return y << 8 | z << 4 | x;
+    private static final int NUM_X_BITS = 26; // 1 + MathHelper.log2(MathHelper.smallestEncompassingPowerOfTwo(30000000));
+    private static final int NUM_Z_BITS = NUM_X_BITS;
+    private static final int NUM_Y_BITS = 64 - NUM_X_BITS - NUM_Z_BITS;
+    private static final int Y_SHIFT = NUM_Z_BITS;
+    private static final int X_SHIFT = Y_SHIFT + NUM_Y_BITS;
+    private static final long X_MASK = (1L << NUM_X_BITS) - 1L;
+    private static final long Y_MASK = (1L << NUM_Y_BITS) - 1L;
+    private static final long Z_MASK = (1L << NUM_Z_BITS) - 1L;
+
+    /** A chunk in the table and whether it came from the game or was made up. */
+    static final class Entry {
+        final Chunk chunk;
+        volatile int state;
+
+        Entry(int state, Chunk chunk) {
+            this.state = state;
+            this.chunk = chunk;
+        }
     }
 
-    chunkX and chunkZ are chunk coords, not block coords.
-    */
-    public static native void insertChunkData(long context, int chunkX, int chunkZ, boolean[] data);
+    private static final Entry AIR_ENTRY = new Entry(STATE_FAKE, Chunk.AIR);
 
-    public static native long allocateAndInsertChunk(long context, int x, int z);
+    private final ConcurrentHashMap<Long, Entry> chunks = new ConcurrentHashMap<>();
+    private final Set<Long> checkedRegions = ConcurrentHashMap.newKeySet();
+    private final AtomicBoolean cancelFlag = new AtomicBoolean();
+    private final ChunkGeneratorHell generator;
+    private final String baritoneCache;
+    private final long seed;
+    private final int dimension;
+    final int maxHeight;
 
-    // do not write to the chunk this returns
-    public static native long getChunkOrDefault(long context, int x, int z, boolean solid);
+    /**
+     * @param seed                      the world seed, for generating terrain where no chunk is known
+     * @param baritoneCacheDirCanBeNull Baritone's region directory for the dimension, whose chunks a search loads as it reaches them; or null
+     * @param dimension                 one of the DIMENSION_ constants
+     * @param maxHeight                 the height the search and rays stay under, 1 to 384
+     */
+    public NetherPathfinder(long seed, String baritoneCacheDirCanBeNull, int dimension, int maxHeight) {
+        if (dimension < 0 || dimension > 2) {
+            throw new IllegalArgumentException("Invalid dimension");
+        }
+        if (maxHeight <= 0 || maxHeight > Chunk.HEIGHT) {
+            throw new IllegalArgumentException("Invalid max height (must be between 0 and 384)");
+        }
+        this.seed = seed;
+        this.baritoneCache = baritoneCacheDirCanBeNull;
+        this.dimension = dimension;
+        this.maxHeight = maxHeight;
+        this.generator = ChunkGeneratorHell.fromSeed(seed);
+    }
 
-    public static native long getChunk(long context, int x, int z);
+    /** The native API's name for the constructor. */
+    public static NetherPathfinder newContext(long seed, String baritoneCacheDirCanBeNull, int dimension, int maxHeight) {
+        return new NetherPathfinder(seed, baritoneCacheDirCanBeNull, dimension, maxHeight);
+    }
 
-    // returns true if the chunk existed and the change was made
-    public static native boolean setChunkState(long context, int x, int z, boolean fromJava);
+    /** There is no native library any more, so every system is supported. Kept for callers of the old API. */
+    public static boolean isThisSystemSupported() {
+        return true;
+    }
 
-    public static native boolean hasChunkFromJava(long context, int x, int z);
+    public long getSeed() {
+        return this.seed;
+    }
 
-    public static native void cullFarChunks(long context, int chunkX, int chunkZ, int maxDistanceBlocks);
+    public int getDimension() {
+        return this.dimension;
+    }
 
-    public static native PathSegment pathFind(long context, int x1, int y1, int z1, int x2, int y2, int z2, boolean atLeastX4, boolean refine, int failTimeoutInMillis, boolean defaultAirElseGenerate, double fakeChunkCost);
+    public int getMaxHeight() {
+        return this.maxHeight;
+    }
 
-    private static native void raytrace0(long context, int fakeChunkMode, int inputs, double[] start, double[] end, boolean[] hitsOut, double[] hitPosOutCanBeNull);
+    /** Cancels a running search and forgets every chunk. The native API's name for it. */
+    public void freeContext() {
+        close();
+    }
 
-    public static void raytrace(long context, int fakeChunkMode, int inputs, double[] start, double[] end, boolean[] hitsOut, double[] hitPosOutCanBeNull) {
+    @Override
+    public void close() {
+        cancel();
+        this.chunks.clear();
+        this.checkedRegions.clear();
+    }
+
+    static long key(int x, int z) {
+        return ((long) x << 32) | (z & 0xFFFFFFFFL);
+    }
+
+    static int dimensionHeight(int dimension) {
+        return dimension == DIMENSION_OVERWORLD ? 384 : 256;
+    }
+
+    static long packBlockPos(BlockPos pos) {
+        return ((long) pos.x & X_MASK) << X_SHIFT | ((long) pos.y & Y_MASK) << Y_SHIFT | ((long) pos.z & Z_MASK);
+    }
+
+    private static boolean inBounds(int y) {
+        return y >= 0 && y < Chunk.HEIGHT;
+    }
+
+    private static void checkFakeChunkMode(int mode) {
+        if (mode < 0 || mode > 2) {
+            throw new IllegalArgumentException("fakeChunkMode must be 0 (Generate), 1 (Air), or 2 (Solid)");
+        }
+    }
+
+    // ---- the chunk table ----
+
+    /**
+     * Inserts a chunk from the game, replacing any chunk at that position. {@code data} has one
+     * boolean per block, indexed {@code y << 8 | z << 4 | x}, 16 * 16 * 256 of them (384 in the overworld).
+     */
+    public void insertChunkData(int chunkX, int chunkZ, boolean[] data) {
+        final int blocksInChunk = 16 * 16 * dimensionHeight(this.dimension);
+        if (data.length != blocksInChunk) {
+            throw new IllegalArgumentException(this.dimension == DIMENSION_OVERWORLD ? "input is not 16 * 16 * 384 elements" : "input is not 16 * 16 * 256 elements");
+        }
+        final Chunk chunk = new Chunk();
+        for (int i = 0; i < blocksInChunk; i++) {
+            if (data[i]) {
+                chunk.setBlock(i & 0xF, i >> 8, (i >> 4) & 0xF, true);
+            }
+        }
+        this.chunks.put(key(chunkX, chunkZ), new Entry(STATE_FROM_JAVA, chunk));
+    }
+
+    /** Inserts a new, empty chunk from the game at (x, z), replacing any chunk there, and returns it to be filled. */
+    public Chunk allocateAndInsertChunk(int x, int z) {
+        final Chunk chunk = new Chunk();
+        this.chunks.put(key(x, z), new Entry(STATE_FROM_JAVA, chunk));
+        return chunk;
+    }
+
+    /** The chunk at (x, z), or the shared all-solid or all-air chunk if there is none. Do not write to the shared ones. */
+    public Chunk getChunkOrDefault(int x, int z, boolean solid) {
+        final Entry e = this.chunks.get(key(x, z));
+        return e != null ? e.chunk : (solid ? Chunk.SOLID : Chunk.AIR);
+    }
+
+    /** The chunk at (x, z), or null. */
+    public Chunk getChunk(int x, int z) {
+        final Entry e = this.chunks.get(key(x, z));
+        return e != null ? e.chunk : null;
+    }
+
+    /** Marks the chunk at (x, z) as from the game or as made up. Returns true if the chunk existed and the change was made. */
+    public boolean setChunkState(int x, int z, boolean fromJava) {
+        final Entry e = this.chunks.get(key(x, z));
+        if (e == null) {
+            return false;
+        }
+        e.state = fromJava ? STATE_FROM_JAVA : STATE_FAKE;
+        return true;
+    }
+
+    public boolean hasChunkFromJava(int x, int z) {
+        final Entry e = this.chunks.get(key(x, z));
+        return e != null && e.state == STATE_FROM_JAVA;
+    }
+
+    /** Forgets every chunk more than maxDistanceBlocks (in whole chunks) from (chunkX, chunkZ). */
+    public void cullFarChunks(int chunkX, int chunkZ, int maxDistanceBlocks) {
+        final long distChunks = maxDistanceBlocks / 16;
+        final long distSq = distChunks * distChunks;
+        this.chunks.entrySet().removeIf(entry -> {
+            final long key = entry.getKey();
+            final long dx = (int) (key >> 32) - chunkX;
+            final long dz = (int) key - chunkZ;
+            return dx * dx + dz * dz > distSq;
+        });
+    }
+
+    /** How many chunks the table holds. */
+    public int chunkCount() {
+        return this.chunks.size();
+    }
+
+    // ---- searching ----
+
+    /**
+     * A path from (x1, y1, z1) towards (x2, y2, z2), or null if none was found in time or the
+     * search was cancelled. The segment is finished if it reached the goal.
+     *
+     * @param atLeastX4               do not squeeze through cubes smaller than 4 blocks
+     * @param refine                  drop points that are visible from an earlier one
+     * @param failTimeoutInMillis     give up after this long with nothing; 0 for 30 seconds
+     * @param defaultAirElseGenerate  treat unknown chunks as air, instead of generating them from the seed
+     * @param fakeChunkCost           the cost of a step through a chunk that was not given by the game, against 1 for one that was
+     */
+    public PathSegment pathFind(int x1, int y1, int z1, int x2, int y2, int z2, boolean atLeastX4, boolean refine, int failTimeoutInMillis, boolean defaultAirElseGenerate, double fakeChunkCost) {
+        if (!inBounds(y1) || !inBounds(y2)) {
+            throw new IllegalArgumentException("Invalid y1 or y2");
+        }
+        this.cancelFlag.set(false);
+        final Size size = atLeastX4 ? Size.X4 : Size.X2;
+        final NodePos start = PathFinder.findAir(this, size, new BlockPos(x1, y1, z1), defaultAirElseGenerate);
+        final NodePos goal = PathFinder.findAir(this, size, new BlockPos(x2, y2, z2), defaultAirElseGenerate);
+        final PathFinder.Path path = PathFinder.findPathSegment(this, start, goal, atLeastX4, failTimeoutInMillis, defaultAirElseGenerate, fakeChunkCost);
+        if (path == null) {
+            return null;
+        }
+        final List<BlockPos> blocks = refine ? Raytracer.refine(this, path.blocks) : path.blocks;
+        final long[] packed = new long[blocks.size()];
+        for (int i = 0; i < packed.length; i++) {
+            packed[i] = packBlockPos(blocks.get(i));
+        }
+        return new PathSegment(path.type == PathFinder.Path.Type.FINISHED, packed);
+    }
+
+    /** Asks a running search to stop. Returns whether it had already been asked. */
+    public boolean cancel() {
+        return this.cancelFlag.getAndSet(true);
+    }
+
+    boolean isCancelled() {
+        return this.cancelFlag.get();
+    }
+
+    boolean clearCancelled() {
+        return this.cancelFlag.getAndSet(false);
+    }
+
+    // ---- rays ----
+
+    /**
+     * Traces {@code inputs} segments, start[i*3..] to end[i*3..]. hitsOut[i] says whether segment i
+     * hit a solid block, and if hitPosOutCanBeNull is given, where. Points and the segments between
+     * them must have 0 <= y < 384.
+     */
+    public void raytrace(int fakeChunkMode, int inputs, double[] start, double[] end, boolean[] hitsOut, double[] hitPosOutCanBeNull) {
+        checkFakeChunkMode(fakeChunkMode);
         if (start.length < (inputs * 3) || end.length < (inputs * 3) || hitsOut.length < inputs || (hitPosOutCanBeNull != null && hitPosOutCanBeNull.length < (inputs * 3))) {
             throw new IllegalArgumentException("Bad array lengths idiot");
         }
-        raytrace0(context, fakeChunkMode, inputs, start, end, hitsOut, hitPosOutCanBeNull);
+        for (int i = 0; i < inputs; i++) {
+            hitsOut[i] = Raytracer.raytrace(this, start[i * 3], start[i * 3 + 1], start[i * 3 + 2], end[i * 3], end[i * 3 + 1], end[i * 3 + 2], fakeChunkMode, hitPosOutCanBeNull, i * 3);
+        }
     }
-    private static native int isVisibleMulti0(long context, int fakeChunkMode, int inputs, double[] start, double[] end, boolean anyIfTrueElseAll);
 
-    public static int isVisibleMulti(long context, int fakeChunkMode, int inputs, double[] start, double[] end, boolean anyIfTrueElseAll) {
+    /**
+     * With anyIfTrueElseAll, the index of the first segment that is clear, else the index of the
+     * first that is blocked; -1 if there is none. So -1 means "none clear" in the first mode and
+     * "all clear" in the second.
+     */
+    public int isVisibleMulti(int fakeChunkMode, int inputs, double[] start, double[] end, boolean anyIfTrueElseAll) {
+        checkFakeChunkMode(fakeChunkMode);
         if (start.length < (inputs * 3) || end.length < (inputs * 3)) {
             throw new IllegalArgumentException("Bad array lengths idiot");
         }
-        return isVisibleMulti0(context, fakeChunkMode, inputs, start, end, anyIfTrueElseAll);
-    }
-
-    public static native boolean isVisible(long context, int fakeChunkMode, double x1, double y1, double z1, double x2, double y2, double z2);
-
-    public static native boolean cancel(long context);
-
-    static native long getX2Index();
-
-    // TODO: convenient function for computing a full path
-
-    private static final boolean IS_LOADED;
-
-    public static boolean isThisSystemSupported() {
-        return IS_LOADED;
-    }
-
-    private static String getNativeLibName() {
-        final int bits = Integer.parseInt(System.getProperty("sun.arch.data.model"));
-        if (bits != 64) {
-            throw new UnsupportedOperationException("Unsupported architecture (64-bit required)");
-        }
-
-        final String osName = System.getProperty("os.name").toLowerCase();
-        final String osArch = System.getProperty("os.arch").toLowerCase();
-
-        final String arch;
-        if (osArch.contains("arm") || osArch.contains("aarch64")) {
-            arch = "aarch64";
-        } else if (osArch.equals("x86_64") || osArch.equals("amd64")) {
-            arch = "x86_64";
-        } else {
-            throw new UnsupportedOperationException("Unsupported architecture: " + osArch);
-        }
-
-        if (osName.contains("linux")) {
-            return "libnether_pathfinder-" + arch + ".so";
-        } else if (osName.contains("windows")) {
-            return "nether_pathfinder-" + arch + ".dll";
-        } else if (osName.contains("mac")) {
-            return "libnether_pathfinder-" + arch + ".dylib";
-        } else {
-            throw new UnsupportedOperationException("Unsupported operating system: " + osName);
-        }
-    }
-
-    private static byte[] getNativeLib(final String libName) throws IOException {
-        try (
-            final InputStream nativesRaw = NetherPathfinder.class.getClassLoader().getResourceAsStream("natives.zip.xz");
-            final XZInputStream nativesZx = new XZInputStream(nativesRaw);
-            final ZipInputStream nativesZip = new ZipInputStream(nativesZx)
-        ) {
-            ZipEntry entry;
-            while ((entry = nativesZip.getNextEntry()) != null) {
-                if (!entry.getName().equals(libName)) {
-                    continue;
+        for (int i = 0; i < inputs; i++) {
+            final boolean hit = Raytracer.raytrace(this, start[i * 3], start[i * 3 + 1], start[i * 3 + 2], end[i * 3], end[i * 3 + 1], end[i * 3 + 2], fakeChunkMode, null, 0);
+            if (!hit) {
+                if (anyIfTrueElseAll) {
+                    return i;
                 }
-
-                final ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
-                final byte[] buffer = new byte[4096];
-
-                int read;
-                while ((read = nativesZip.read(buffer)) != -1) {
-                    byteStream.write(buffer, 0, read);
-                }
-
-                return byteStream.toByteArray();
+            } else if (!anyIfTrueElseAll) {
+                return i;
             }
         }
-        throw new NullPointerException("Failed to find pathfinder library: " + libName);
+        return -1;
     }
 
-    private static void tryLoadLibrary() throws IOException {
-        final String libName = getNativeLibName();
-        final byte[] libBytes = getNativeLib(libName);
-
-        final String[] split = libName.split("\\.");
-        final Path tempFile = Files.createTempFile(split[0], "." + split[1]);
-        System.out.println("[nether-pathfinder] Created temp file at " + tempFile.toAbsolutePath());
-
-        try {
-            Files.write(tempFile, libBytes);
-            System.load(tempFile.toAbsolutePath().toString());
-        } finally {
-            try {
-                Files.delete(tempFile);
-            } catch (IOException ignored) {
-                System.err.println("[nether-pathfinder] Failed to delete temp file");
-//                System.out.println("trolled");
-//                ex.printStackTrace();
-            }
-            if (!tempFile.toFile().delete()) {
-                tempFile.toFile().deleteOnExit();
-            }
-        }
+    /** Whether there is line of sight between the two points. */
+    public boolean isVisible(int fakeChunkMode, double x1, double y1, double z1, double x2, double y2, double z2) {
+        checkFakeChunkMode(fakeChunkMode);
+        return !Raytracer.raytrace(this, x1, y1, z1, x2, y2, z2, fakeChunkMode, null, 0);
     }
 
-    static {
-        boolean loaded = false;
-        try {
-            tryLoadLibrary();
-            System.out.println("[nether-pathfinder] Loaded shared library");
-            loaded = true;
-        } catch (Throwable e) {
-            System.err.println("[nether-pathfinder] Failed to load shared library");
-            e.printStackTrace();
+    // ---- for the search and the rays ----
+
+    Entry getChunkOrAir(int cx, int cz) {
+        final Entry e = this.chunks.get(key(cx, cz));
+        return e != null ? e : AIR_ENTRY;
+    }
+
+    Chunk getRealChunkOrDefault(int cx, int cz, boolean solid) {
+        final Entry e = this.chunks.get(key(cx, cz));
+        if (e == null || e.state != STATE_FROM_JAVA) {
+            return solid ? Chunk.SOLID : Chunk.AIR;
         }
-        IS_LOADED = loaded;
+        return e.chunk;
+    }
+
+    /** The chunk at (cx, cz), generated from the seed and inserted if there is none. */
+    Chunk getOrGenChunk(int cx, int cz) {
+        final long key = key(cx, cz);
+        final Entry e = this.chunks.get(key);
+        if (e != null) {
+            return e.chunk;
+        }
+        final Chunk chunk = this.generator.generateChunk(cx, cz);
+        final Entry previous = this.chunks.putIfAbsent(key, new Entry(STATE_FAKE, chunk));
+        // someone else generated this chunk while we were generating it
+        return previous != null ? previous.chunk : chunk;
+    }
+
+    Chunk getRealChunkFromCacheOrFakeChunkMaybeGen(int cx, int cz, int fakeChunkMode) {
+        if (fakeChunkMode == CACHE_MISS_GENERATE) {
+            return getOrGenChunk(cx, cz);
+        }
+        return getRealChunkOrDefault(cx, cz, fakeChunkMode == CACHE_MISS_SOLID);
+    }
+
+    /**
+     * Loads the Baritone region holding chunk (cx, cz) the first time it is asked about. A chunk
+     * that is already in the table wins over the file's. Returns the nanoseconds spent on the file.
+     */
+    long tryLoadRegion(int cx, int cz) {
+        if (this.baritoneCache == null) {
+            return 0;
+        }
+        final int regionX = cx >> 5;
+        final int regionZ = cz >> 5;
+        if (!this.checkedRegions.add(key(regionX, regionZ))) {
+            return 0;
+        }
+        final long t1 = System.nanoTime();
+        final boolean read = BaritoneRegion.load(this.baritoneCache, regionX, regionZ,
+                (x, z, chunk) -> this.chunks.putIfAbsent(key(x, z), new Entry(STATE_FROM_JAVA, chunk)));
+        return read ? System.nanoTime() - t1 : 0;
     }
 }

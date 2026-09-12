@@ -1,0 +1,181 @@
+package dev.babbaj.pathfinder;
+
+import java.util.Arrays;
+
+/**
+ * A 16 by 384 by 16 column of blocks, one bit each, laid out as an octree so that a cube of 2, 4,
+ * 8 or 16 blocks can be tested for emptiness with a few long reads. The layout is the native
+ * library's: 24 slabs of 16x16x16 blocks (512 bytes each); a slab is 8 x8 cubes of 64 bytes; an
+ * x8 is 8 x4 cubes of 8 bytes; an x4 is 8 x2 cubes of one byte; the 8 bits of that byte are the
+ * blocks. A slab in which no block has been set is not allocated.
+ * <p>
+ * Reads and writes are plain (not synchronized), as they were in the native library: a reader
+ * that races a writer may see a partly written slab, which is the same as before, and nothing
+ * worse can happen.
+ */
+public final class Chunk {
+
+    public static final int HEIGHT = 384;
+    public static final int SLABS = HEIGHT / 16;
+    static final int SLAB_LONGS = 64; // 512 bytes
+    static final int X8_BYTES = 64;
+    static final int X4_BYTES = 8;
+
+    /** A chunk with no blocks. Shared; writes to it throw. */
+    public static final Chunk AIR = new Chunk(false);
+    /** A chunk with every block solid. Shared; writes to it throw. */
+    public static final Chunk SOLID = new Chunk(true);
+
+    private final long[][] slabs = new long[SLABS][];
+    private final boolean shared;
+
+    public Chunk() {
+        this.shared = false;
+    }
+
+    private Chunk(boolean solid) {
+        this.shared = true;
+        if (solid) {
+            for (int i = 0; i < SLABS; i++) {
+                this.slabs[i] = new long[SLAB_LONGS];
+                Arrays.fill(this.slabs[i], -1L);
+            }
+        }
+    }
+
+    // index math, the same as the native Chunk.h
+    static int x8Index(int x, int y, int z) {
+        return ((x & 8) >> 1) | ((y & 8) >> 2) | ((z & 8) >> 3);
+    }
+
+    static int x4Index(int x, int y, int z) {
+        return ((x & 4)) | ((y & 4) >> 1) | ((z & 4) >> 2);
+    }
+
+    static int x2Index(int x, int y, int z) {
+        return ((x & 2) << 1) | ((y & 2)) | ((z & 2) >> 1);
+    }
+
+    static int bitIndex(int x, int y, int z) {
+        return ((x & 1) << 2) | ((y & 1) << 1) | ((z & 1));
+    }
+
+    /** Byte offset, within its slab, of the x2 cube that holds (x, y, z). */
+    static int x2Offset(int x, int y, int z) {
+        return x8Index(x, y, z) * X8_BYTES + x4Index(x, y, z) * X4_BYTES + x2Index(x, y, z);
+    }
+
+    /** The byte at {@code off} in a slab. */
+    static int byteAt(long[] slab, int off) {
+        return (int) (slab[off >>> 3] >>> ((off & 7) << 3)) & 0xFF;
+    }
+
+    static boolean allZero(long[] slab, int from, int longs) {
+        long acc = 0;
+        for (int i = 0; i < longs; i++) {
+            acc |= slab[from + i];
+        }
+        return acc == 0;
+    }
+
+    /** The slab holding y, or null if nothing has been set in it (or y is outside the chunk). */
+    long[] slab(int y) {
+        final int i = y >> 4;
+        return i >= 0 && i < SLABS ? this.slabs[i] : null;
+    }
+
+    /** Coordinates are chunk relative: x and z in 0..15, y in 0..383. */
+    public boolean isSolid(int x, int y, int z) {
+        final long[] s = this.slabs[y >> 4];
+        if (s == null) {
+            return false;
+        }
+        final int off = x2Offset(x, y, z);
+        return ((s[off >>> 3] >>> (((off & 7) << 3) + bitIndex(x, y, z))) & 1L) != 0;
+    }
+
+    /** Coordinates are chunk relative: x and z in 0..15, y in 0..383. */
+    public void setBlock(int x, int y, int z, boolean solid) {
+        if (this.shared) {
+            throw new UnsupportedOperationException("the shared air and solid chunks are read only");
+        }
+        long[] s = this.slabs[y >> 4];
+        if (s == null) {
+            if (!solid) {
+                return;
+            }
+            s = this.slabs[y >> 4] = new long[SLAB_LONGS];
+        }
+        final int off = x2Offset(x, y, z);
+        final long mask = 1L << (((off & 7) << 3) + bitIndex(x, y, z));
+        if (solid) {
+            s[off >>> 3] |= mask;
+        } else {
+            s[off >>> 3] &= ~mask;
+        }
+    }
+
+    /** Sets every block of one 16x16x16 section (0..23) at once. */
+    public void fillSection(int section, boolean solid) {
+        if (this.shared) {
+            throw new UnsupportedOperationException("the shared air and solid chunks are read only");
+        }
+        if (!solid) {
+            this.slabs[section] = null;
+            return;
+        }
+        long[] s = this.slabs[section];
+        if (s == null) {
+            s = this.slabs[section] = new long[SLAB_LONGS];
+        }
+        Arrays.fill(s, -1L);
+    }
+
+    public boolean isEmpty(Size size, int x, int y, int z) {
+        switch (size) {
+            case X1: return !isSolid(x, y, z);
+            case X2: return isEmptyX2(x, y, z);
+            case X4: return isEmptyX4(x, y, z);
+            case X8: return isEmptyX8(x, y, z);
+            default: return isEmptyX16(y);
+        }
+    }
+
+    public boolean isEmptyX16(int y) {
+        final long[] s = this.slabs[y >> 4];
+        return s == null || allZero(s, 0, SLAB_LONGS);
+    }
+
+    public boolean isEmptyX8(int x, int y, int z) {
+        final long[] s = this.slabs[y >> 4];
+        return s == null || allZero(s, x8Index(x, y, z) * (X8_BYTES / 8), X8_BYTES / 8);
+    }
+
+    public boolean isEmptyX4(int x, int y, int z) {
+        final long[] s = this.slabs[y >> 4];
+        return s == null || s[x8Index(x, y, z) * (X8_BYTES / 8) + x4Index(x, y, z)] == 0;
+    }
+
+    public boolean isEmptyX2(int x, int y, int z) {
+        final long[] s = this.slabs[y >> 4];
+        return s == null || byteAt(s, x2Offset(x, y, z)) == 0;
+    }
+
+    /** The chunk's 12288 bytes in the native layout (little endian words), for hashing in tests. */
+    byte[] toBytes() {
+        final byte[] out = new byte[SLABS * SLAB_LONGS * 8];
+        for (int i = 0; i < SLABS; i++) {
+            final long[] s = this.slabs[i];
+            if (s == null) {
+                continue;
+            }
+            for (int j = 0; j < SLAB_LONGS; j++) {
+                long v = s[j];
+                for (int k = 0; k < 8; k++) {
+                    out[(i * SLAB_LONGS + j) * 8 + k] = (byte) (v >>> (k * 8));
+                }
+            }
+        }
+        return out;
+    }
+}
