@@ -97,10 +97,10 @@ final class Raytracer {
     /** Bytes of a child of a node at each level: x16 (4) has x8 children of 64 bytes, and so on. x2's children are bits. */
     private static final int[] CHILD_BYTES = {0, 0, 1, 8, 64};
 
-    private static boolean emptyNode(long[] slab, int off, int level) {
+    private static boolean emptyNode(long[] slab, int filled, int off, int level) {
         switch (level) {
-            case 4: return Chunk.allZero(slab, 0, Chunk.SLAB_LONGS);
-            case 3: return Chunk.allZero(slab, off >>> 3, Chunk.X8_BYTES / 8);
+            case 4: return filled == 0;
+            case 3: return (filled & (1 << (off >>> 6))) == 0; // the x8 at byte offset off is x8 number off / 64
             case 2: return slab[off >>> 3] == 0;
             default: return Chunk.byteAt(slab, off) == 0;
         }
@@ -108,13 +108,14 @@ final class Raytracer {
 
     /**
      * Walks the ray through one node. level 4 is an x16 (the whole slab), 0 a block; a node is
-     * the slab plus a byte offset, and at level 0 {@code bit} says which bit of the byte.
+     * the slab plus a byte offset, and at level 0 {@code bit} says which bit of the byte. {@code
+     * filled} is the slab's summary of which of its x8 cubes hold a block, see {@link Chunk#filled}.
      * Returns NaN for a miss, positive infinity when the ray ended inside without hitting, and
      * otherwise the length along the ray at which it hit.
      */
     private static double procSubtree(int a, double ox, double oy, double oz, double targetLen,
                                       double tx0, double ty0, double tz0, double tx1, double ty1, double tz1,
-                                      int level, int nx, int ny, int nz, long[] slab, int off, int bit) {
+                                      int level, int nx, int ny, int nz, long[] slab, int filled, int off, int bit) {
         // if this node is behind us
         if (tx1 < 0.0 || ty1 < 0.0 || tz1 < 0.0) {
             return Double.NaN;
@@ -134,7 +135,7 @@ final class Raytracer {
                 return tz0; // plane XY
             }
         }
-        if (slab == null || emptyNode(slab, off, level)) {
+        if (slab == null || emptyNode(slab, filled, off, level)) {
             // we know that all the leafs are empty
             return Double.NaN;
         }
@@ -153,49 +154,49 @@ final class Raytracer {
             switch (currNode) {
                 case 0:
                     i = a;
-                    r = procSubtree(a, ox, oy, oz, targetLen, tx0, ty0, tz0, txm, tym, tzm, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, level == 1 ? off : off + i * childBytes, i);
+                    r = procSubtree(a, ox, oy, oz, targetLen, tx0, ty0, tz0, txm, tym, tzm, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, filled, level == 1 ? off : off + i * childBytes, i);
                     if (!Double.isNaN(r)) return r;
                     currNode = newNode(txm, 4, tym, 2, tzm, 1);
                     break;
                 case 1:
                     i = 1 ^ a;
-                    r = procSubtree(a, ox, oy, oz, targetLen, tx0, ty0, tzm, txm, tym, tz1, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, level == 1 ? off : off + i * childBytes, i);
+                    r = procSubtree(a, ox, oy, oz, targetLen, tx0, ty0, tzm, txm, tym, tz1, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, filled, level == 1 ? off : off + i * childBytes, i);
                     if (!Double.isNaN(r)) return r;
                     currNode = newNode(txm, 5, tym, 3, tz1, 8);
                     break;
                 case 2:
                     i = 2 ^ a;
-                    r = procSubtree(a, ox, oy, oz, targetLen, tx0, tym, tz0, txm, ty1, tzm, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, level == 1 ? off : off + i * childBytes, i);
+                    r = procSubtree(a, ox, oy, oz, targetLen, tx0, tym, tz0, txm, ty1, tzm, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, filled, level == 1 ? off : off + i * childBytes, i);
                     if (!Double.isNaN(r)) return r;
                     currNode = newNode(txm, 6, ty1, 8, tzm, 3);
                     break;
                 case 3:
                     i = 3 ^ a;
-                    r = procSubtree(a, ox, oy, oz, targetLen, tx0, tym, tzm, txm, ty1, tz1, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, level == 1 ? off : off + i * childBytes, i);
+                    r = procSubtree(a, ox, oy, oz, targetLen, tx0, tym, tzm, txm, ty1, tz1, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, filled, level == 1 ? off : off + i * childBytes, i);
                     if (!Double.isNaN(r)) return r;
                     currNode = newNode(txm, 7, ty1, 8, tz1, 8);
                     break;
                 case 4:
                     i = 4 ^ a;
-                    r = procSubtree(a, ox, oy, oz, targetLen, txm, ty0, tz0, tx1, tym, tzm, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, level == 1 ? off : off + i * childBytes, i);
+                    r = procSubtree(a, ox, oy, oz, targetLen, txm, ty0, tz0, tx1, tym, tzm, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, filled, level == 1 ? off : off + i * childBytes, i);
                     if (!Double.isNaN(r)) return r;
                     currNode = newNode(tx1, 8, tym, 6, tzm, 5);
                     break;
                 case 5:
                     i = 5 ^ a;
-                    r = procSubtree(a, ox, oy, oz, targetLen, txm, ty0, tzm, tx1, tym, tz1, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, level == 1 ? off : off + i * childBytes, i);
+                    r = procSubtree(a, ox, oy, oz, targetLen, txm, ty0, tzm, tx1, tym, tz1, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, filled, level == 1 ? off : off + i * childBytes, i);
                     if (!Double.isNaN(r)) return r;
                     currNode = newNode(tx1, 8, tym, 7, tz1, 8);
                     break;
                 case 6:
                     i = 6 ^ a;
-                    r = procSubtree(a, ox, oy, oz, targetLen, txm, tym, tz0, tx1, ty1, tzm, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, level == 1 ? off : off + i * childBytes, i);
+                    r = procSubtree(a, ox, oy, oz, targetLen, txm, tym, tz0, tx1, ty1, tzm, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, filled, level == 1 ? off : off + i * childBytes, i);
                     if (!Double.isNaN(r)) return r;
                     currNode = newNode(tx1, 8, ty1, 8, tzm, 7);
                     break;
                 default:
                     i = 7 ^ a;
-                    r = procSubtree(a, ox, oy, oz, targetLen, txm, tym, tzm, tx1, ty1, tz1, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, level == 1 ? off : off + i * childBytes, i);
+                    r = procSubtree(a, ox, oy, oz, targetLen, txm, tym, tzm, tx1, ty1, tz1, childLevel, nx + ((i & 4) != 0 ? half : 0), ny + ((i & 2) != 0 ? half : 0), nz + ((i & 1) != 0 ? half : 0), slab, filled, level == 1 ? off : off + i * childBytes, i);
                     if (!Double.isNaN(r)) return r;
                     return Double.NaN;
             }
@@ -205,7 +206,7 @@ final class Raytracer {
 
     /** One x16 node. The ray is already reflected. */
     private static int raytrace16(int a, double rox, double roy, double roz, double rdx, double rdy, double rdz, double targetLen,
-                                  int nx, int ny, int nz, long[] slab, Step step) {
+                                  int nx, int ny, int nz, long[] slab, int filled, Step step) {
         // IEEE stability fix
         final double divx = 1 / rdx;
         final double divy = 1 / rdy;
@@ -222,7 +223,7 @@ final class Raytracer {
         final double tmin = max(max(tx0, ty0), tz0);
         final double tmax = min(min(tx1, ty1), tz1);
         if (tmin <= tmax) {
-            final double r = procSubtree(a, rox, roy, roz, targetLen, tx0, ty0, tz0, tx1, ty1, tz1, 4, nx, ny, nz, slab, 0, 0);
+            final double r = procSubtree(a, rox, roy, roz, targetLen, tx0, ty0, tz0, tx1, ty1, tz1, 4, nx, ny, nz, slab, filled, 0, 0);
             if (r == Double.POSITIVE_INFINITY) {
                 return FINISHED;
             }
@@ -273,7 +274,7 @@ final class Raytracer {
             if ((a & 4) != 0) { rox = reflect(fx, nx + 8); rdx = -dx; }
             if ((a & 2) != 0) { roy = reflect(fy, ny + 8); rdy = -dy; }
             if ((a & 1) != 0) { roz = reflect(fz, nz + 8); rdz = -dz; }
-            final int result = raytrace16(a, rox, roy, roz, rdx, rdy, rdz, targetLen, nx, ny, nz, slab, step);
+            final int result = raytrace16(a, rox, roy, roz, rdx, rdy, rdz, targetLen, nx, ny, nz, slab, chunk.filled(ny), step);
             if (result == FINISHED) {
                 return false;
             }

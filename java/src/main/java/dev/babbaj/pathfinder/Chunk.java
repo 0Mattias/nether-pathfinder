@@ -7,7 +7,10 @@ import java.util.Arrays;
  * 8 or 16 blocks can be tested for emptiness with a few long reads. The layout is the native
  * library's: 24 slabs of 16x16x16 blocks (512 bytes each); a slab is 8 x8 cubes of 64 bytes; an
  * x8 is 8 x4 cubes of 8 bytes; an x4 is 8 x2 cubes of one byte; the 8 bits of that byte are the
- * blocks. A slab in which no block has been set is not allocated.
+ * blocks. A slab in which no block has been set is not allocated. Beside the slabs, one byte per
+ * slab says which of its x8 cubes hold a block, so that the question a search asks first and a ray
+ * asks of every x16 and x8 it enters, whether a cube that big is empty, is a bit test rather than a
+ * scan of 64 or 8 longs.
  * <p>
  * Reads and writes are plain (not synchronized), as they were in the native library: a reader
  * that races a writer may see a partly written slab, which is the same as before, and nothing
@@ -27,6 +30,8 @@ public final class Chunk {
     public static final Chunk SOLID = new Chunk(true);
 
     private final long[][] slabs = new long[SLABS][];
+    /** Bit i of entry s is set while x8 cube i of slab s holds a block. A slab that is null has 0. */
+    private final int[] filled = new int[SLABS];
     private final boolean shared;
 
     public Chunk() {
@@ -39,6 +44,7 @@ public final class Chunk {
             for (int i = 0; i < SLABS; i++) {
                 this.slabs[i] = new long[SLAB_LONGS];
                 Arrays.fill(this.slabs[i], -1L);
+                this.filled[i] = 0xFF;
             }
         }
     }
@@ -84,6 +90,12 @@ public final class Chunk {
         return i >= 0 && i < SLABS ? this.slabs[i] : null;
     }
 
+    /** Which x8 cubes of the slab holding y hold a block, one bit each in x8Index order; 0 outside the chunk. */
+    int filled(int y) {
+        final int i = y >> 4;
+        return i >= 0 && i < SLABS ? this.filled[i] : 0;
+    }
+
     /** Coordinates are chunk relative: x and z in 0..15, y in 0..383. */
     public boolean isSolid(int x, int y, int z) {
         final long[] s = this.slabs[y >> 4];
@@ -108,10 +120,16 @@ public final class Chunk {
         }
         final int off = x2Offset(x, y, z);
         final long mask = 1L << (((off & 7) << 3) + bitIndex(x, y, z));
+        final int x8 = x8Index(x, y, z);
         if (solid) {
+            // the x8 is marked before its block is set, so a reader racing this write never skips a block it can see
+            this.filled[y >> 4] |= 1 << x8;
             s[off >>> 3] |= mask;
         } else {
             s[off >>> 3] &= ~mask;
+            if (allZero(s, x8 * (X8_BYTES / 8), X8_BYTES / 8)) {
+                this.filled[y >> 4] &= ~(1 << x8);
+            }
         }
     }
 
@@ -121,6 +139,7 @@ public final class Chunk {
             throw new UnsupportedOperationException("the shared air and solid chunks are read only");
         }
         if (!solid) {
+            this.filled[section] = 0;
             this.slabs[section] = null;
             return;
         }
@@ -128,6 +147,7 @@ public final class Chunk {
         if (s == null) {
             s = this.slabs[section] = new long[SLAB_LONGS];
         }
+        this.filled[section] = 0xFF;
         Arrays.fill(s, -1L);
     }
 
@@ -142,13 +162,11 @@ public final class Chunk {
     }
 
     public boolean isEmptyX16(int y) {
-        final long[] s = this.slabs[y >> 4];
-        return s == null || allZero(s, 0, SLAB_LONGS);
+        return this.filled[y >> 4] == 0;
     }
 
     public boolean isEmptyX8(int x, int y, int z) {
-        final long[] s = this.slabs[y >> 4];
-        return s == null || allZero(s, x8Index(x, y, z) * (X8_BYTES / 8), X8_BYTES / 8);
+        return (this.filled[y >> 4] & (1 << x8Index(x, y, z))) == 0;
     }
 
     public boolean isEmptyX4(int x, int y, int z) {

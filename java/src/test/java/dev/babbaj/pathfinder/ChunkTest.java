@@ -44,6 +44,16 @@ public class ChunkTest {
         assertFalse(chunk.isEmpty(Size.X1, 9, 70, 3));
         assertTrue(chunk.isEmpty(Size.X1, 8, 70, 3));
         assertTrue(chunk.isEmpty(Size.X16, 0, 80, 0));
+
+        // clearing a block empties its x8 and x16 again only once it was the last one there
+        chunk.setBlock(10, 70, 3, true);
+        chunk.setBlock(9, 70, 3, false);
+        assertFalse(chunk.isEmptyX8(9, 70, 3));
+        assertFalse(chunk.isEmptyX16(64));
+        chunk.setBlock(10, 70, 3, false);
+        assertTrue(chunk.isEmptyX8(9, 70, 3));
+        assertTrue(chunk.isEmptyX16(64));
+        assertNotNull(chunk.slab(64)); // the slab stays allocated
     }
 
     @Test
@@ -68,8 +78,14 @@ public class ChunkTest {
         assertTrue(chunk.isSolid(0, 64, 0));
         assertTrue(chunk.isSolid(15, 79, 15));
         assertFalse(chunk.isSolid(0, 80, 0));
+        assertFalse(chunk.isEmptyX8(15, 79, 15));
+        assertTrue(chunk.isEmptyX8(0, 80, 0));
         chunk.fillSection(4, false);
         assertTrue(chunk.isEmptyX16(64));
+        assertTrue(chunk.isEmptyX8(15, 79, 15));
+        chunk.fillSection(4, true);
+        chunk.setBlock(15, 79, 15, false);
+        assertFalse("the section still has the other blocks", chunk.isEmptyX8(15, 79, 15));
     }
 
     @Test
