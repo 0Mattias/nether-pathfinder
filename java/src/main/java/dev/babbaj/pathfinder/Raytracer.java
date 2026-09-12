@@ -247,13 +247,39 @@ final class Raytracer {
     /**
      * Traces the segment from (fx, fy, fz) to (tx, ty, tz). Returns true if it hit a solid block;
      * the hit position is then written to {@code hitOut} at {@code hitIndex}, if the array is not null.
-     * The two points must be inside 0 <= y < 384, as must be the segment between them.
+     * The two points must be inside 0 <= y < 384, as must be the segment between them. A segment
+     * of no length is a point, which is a hit if it is inside a block; a coordinate that is not a
+     * finite number is refused.
      */
     static boolean raytrace(NetherPathfinder ctx, double fx, double fy, double fz, double tx, double ty, double tz, int fakeChunkMode, double[] hitOut, int hitIndex) {
         final double vx = tx - fx;
         final double vy = ty - fy;
         final double vz = tz - fz;
         final double targetLen = Math.sqrt(vx * vx + vy * vy + vz * vz);
+        if (!(targetLen < Double.POSITIVE_INFINITY)) {
+            // NaN, or an infinite coordinate: dividing by it would make the direction NaN and the
+            // walk below would step from node to node for ever. The native library did just that.
+            throw new IllegalArgumentException("ray with a coordinate that is not a finite number: ("
+                    + fx + ", " + fy + ", " + fz + ") to (" + tx + ", " + ty + ", " + tz + ")");
+        }
+        if (targetLen == 0.0) {
+            // A point. The same division would make the direction NaN here too, and the native
+            // library exited the process. A ray that starts inside a block reports a hit at its
+            // origin, so a point does the same, and one in the air hits nothing.
+            final int bx = BlockPos.floor(fx);
+            final int by = BlockPos.floor(fy);
+            final int bz = BlockPos.floor(fz);
+            final Chunk chunk = ctx.getRealChunkFromCacheOrFakeChunkMaybeGen(bx >> 4, bz >> 4, fakeChunkMode);
+            if (by < 0 || by >= Chunk.HEIGHT || !chunk.isSolid(bx & 15, by, bz & 15)) {
+                return false;
+            }
+            if (hitOut != null) {
+                hitOut[hitIndex] = fx;
+                hitOut[hitIndex + 1] = fy;
+                hitOut[hitIndex + 2] = fz;
+            }
+            return true;
+        }
         final double dx = vx / targetLen;
         final double dy = vy / targetLen;
         final double dz = vz / targetLen;
