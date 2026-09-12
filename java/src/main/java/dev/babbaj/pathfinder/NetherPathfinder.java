@@ -37,18 +37,22 @@ public final class NetherPathfinder implements AutoCloseable {
     private static final long Y_MASK = (1L << NUM_Y_BITS) - 1L;
     private static final long Z_MASK = (1L << NUM_Z_BITS) - 1L;
 
-    /** A chunk in the table and whether it came from the game or was made up. */
+    /** A chunk in the table, where it is, and whether it came from the game or was made up. */
     static final class Entry {
         final Chunk chunk;
+        final int x;
+        final int z;
         volatile int state;
 
-        Entry(int state, Chunk chunk) {
+        Entry(int state, Chunk chunk, int x, int z) {
             this.state = state;
             this.chunk = chunk;
+            this.x = x;
+            this.z = z;
         }
     }
 
-    private static final Entry AIR_ENTRY = new Entry(STATE_FAKE, Chunk.AIR);
+    private static final Entry AIR_ENTRY = new Entry(STATE_FAKE, Chunk.AIR, 0, 0);
 
     private final ConcurrentHashMap<Long, Entry> chunks = new ConcurrentHashMap<>();
     private final Set<Long> checkedRegions = ConcurrentHashMap.newKeySet();
@@ -113,8 +117,15 @@ public final class NetherPathfinder implements AutoCloseable {
         this.checkedRegions.clear();
     }
 
+    /**
+     * The table's key for chunk (x, z). The pair packed into a long would do, but the table hashes a
+     * Long to its upper half xor its lower half, x ^ z, which over the chunks around a player takes
+     * a few dozen values and turns the table's bins into trees that every lookup then walks; so the
+     * packed pair is multiplied by an odd constant, a bijection that spreads every bit of both
+     * halves over the upper one. The key is not decoded anywhere: an entry knows its own position.
+     */
     static long key(int x, int z) {
-        return ((long) x << 32) | (z & 0xFFFFFFFFL);
+        return (((long) x << 32) | (z & 0xFFFFFFFFL)) * 0x9E3779B97F4A7C15L;
     }
 
     static int dimensionHeight(int dimension) {
@@ -152,13 +163,13 @@ public final class NetherPathfinder implements AutoCloseable {
                 chunk.setBlock(i & 0xF, i >> 8, (i >> 4) & 0xF, true);
             }
         }
-        this.chunks.put(key(chunkX, chunkZ), new Entry(STATE_FROM_JAVA, chunk));
+        this.chunks.put(key(chunkX, chunkZ), new Entry(STATE_FROM_JAVA, chunk, chunkX, chunkZ));
     }
 
     /** Inserts a new, empty chunk from the game at (x, z), replacing any chunk there, and returns it to be filled. */
     public Chunk allocateAndInsertChunk(int x, int z) {
         final Chunk chunk = new Chunk();
-        this.chunks.put(key(x, z), new Entry(STATE_FROM_JAVA, chunk));
+        this.chunks.put(key(x, z), new Entry(STATE_FROM_JAVA, chunk, x, z));
         return chunk;
     }
 
@@ -198,10 +209,9 @@ public final class NetherPathfinder implements AutoCloseable {
     public void cullFarChunks(int chunkX, int chunkZ, int maxDistanceBlocks) {
         final long distChunks = maxDistanceBlocks / 16;
         final long distSq = distChunks * distChunks;
-        this.chunks.entrySet().removeIf(entry -> {
-            final long key = entry.getKey();
-            final long dx = (int) (key >> 32) - chunkX;
-            final long dz = (int) key - chunkZ;
+        this.chunks.values().removeIf(entry -> {
+            final long dx = entry.x - chunkX;
+            final long dz = entry.z - chunkZ;
             return dx * dx + dz * dz > distSq;
         });
     }
@@ -325,7 +335,7 @@ public final class NetherPathfinder implements AutoCloseable {
             return e.chunk;
         }
         final Chunk chunk = this.generator.generateChunk(cx, cz);
-        final Entry previous = this.chunks.putIfAbsent(key, new Entry(STATE_FAKE, chunk));
+        final Entry previous = this.chunks.putIfAbsent(key, new Entry(STATE_FAKE, chunk, cx, cz));
         // someone else generated this chunk while we were generating it
         return previous != null ? previous.chunk : chunk;
     }
@@ -352,7 +362,7 @@ public final class NetherPathfinder implements AutoCloseable {
         }
         final long t1 = System.nanoTime();
         final boolean read = BaritoneRegion.load(this.baritoneCache, regionX, regionZ,
-                (x, z, chunk) -> this.chunks.putIfAbsent(key(x, z), new Entry(STATE_FROM_JAVA, chunk)));
+                (x, z, chunk) -> this.chunks.putIfAbsent(key(x, z), new Entry(STATE_FROM_JAVA, chunk, x, z)));
         return read ? System.nanoTime() - t1 : 0;
     }
 }
